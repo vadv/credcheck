@@ -33,39 +33,20 @@ REVOKE ALL ON pg_password_history FROM PUBLIC;
 GRANT SELECT ON pg_password_history TO pg_read_all_stats;
 
 ----
--- Check a candidate password (and the associated username) against the
--- configured credcheck username/password policy without creating or
--- altering a role. Raises the same error as CREATE/ALTER ROLE would when
--- the policy is violated, and returns true when the password is accepted.
--- Note: the password reuse policy is not evaluated here
+-- Record an authentication failure reported from outside PostgreSQL.
 ----
-CREATE FUNCTION pg_check_password( IN username name, IN password text )
-RETURNS boolean
+CREATE FUNCTION credcheck_record_auth_failure( IN username name )
+RETURNS integer
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT VOLATILE;
 
 ----
--- lastlog: utmp/wtmp-like login history (see credcheck.lastlog GUC).
+-- Return true when a role is currently banned.
 ----
-CREATE FUNCTION credcheck_lastlog (
-	OUT type        text,
-	OUT username    text,
-	OUT pid         integer,
-	OUT client_addr text,
-	OUT client_port integer,
-	OUT login_time  timestamp with time zone,
-	OUT logout_time timestamp with time zone,
-	OUT duration    interval,
-	OUT state       text,
-	OUT query       text
-)
-RETURNS SETOF record
-AS 'MODULE_PATHNAME', 'credcheck_lastlog'
-LANGUAGE C VOLATILE;
+CREATE FUNCTION credcheck_is_banned( IN username name )
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT STABLE;
 
-CREATE VIEW pg_lastlog AS
-  SELECT * FROM credcheck_lastlog();
-
-REVOKE ALL ON FUNCTION credcheck_lastlog() FROM PUBLIC;
-REVOKE ALL ON pg_lastlog FROM PUBLIC;
-GRANT SELECT ON pg_lastlog TO pg_read_all_stats;
+REVOKE ALL ON FUNCTION credcheck_record_auth_failure(name) FROM PUBLIC;
+REVOKE ALL ON FUNCTION credcheck_is_banned(name) FROM PUBLIC;
