@@ -24,6 +24,7 @@ LANGUAGE C VOLATILE;
 CREATE VIEW pg_lastlog AS
   SELECT * FROM credcheck_lastlog();
 
+
 REVOKE ALL ON FUNCTION credcheck_lastlog() FROM PUBLIC;
 REVOKE ALL ON pg_lastlog FROM PUBLIC;
 GRANT SELECT ON pg_lastlog TO pg_read_all_stats;
@@ -39,33 +40,24 @@ GRANT SELECT ON pg_password_history TO pg_read_all_stats;
 -- the policy is violated, and returns true when the password is accepted.
 -- Note: the password reuse policy is not evaluated here
 ----
-CREATE FUNCTION pg_check_password( IN username name, IN password text )
+CREATE OR REPLACE FUNCTION pg_check_password( IN username name, IN password text )
 RETURNS boolean
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT VOLATILE;
 
-----
--- lastlog: utmp/wtmp-like login history (see credcheck.lastlog GUC).
-----
-CREATE FUNCTION credcheck_lastlog (
-	OUT type        text,
-	OUT username    text,
-	OUT pid         integer,
-	OUT client_addr text,
-	OUT client_port integer,
-	OUT login_time  timestamp with time zone,
-	OUT logout_time timestamp with time zone,
-	OUT duration    interval,
-	OUT state       text,
-	OUT query       text
-)
-RETURNS SETOF record
-AS 'MODULE_PATHNAME', 'credcheck_lastlog'
-LANGUAGE C VOLATILE;
+REVOKE ALL ON FUNCTION pg_banned_role() FROM PUBLIC;
+REVOKE ALL ON pg_banned_role FROM PUBLIC;
+GRANT SELECT ON pg_banned_role TO pg_read_all_stats;
 
-CREATE VIEW pg_lastlog AS
-  SELECT * FROM credcheck_lastlog();
+CREATE FUNCTION credcheck_record_auth_failure( IN username name )
+RETURNS integer
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE;
 
-REVOKE ALL ON FUNCTION credcheck_lastlog() FROM PUBLIC;
-REVOKE ALL ON pg_lastlog FROM PUBLIC;
-GRANT SELECT ON pg_lastlog TO pg_read_all_stats;
+CREATE FUNCTION credcheck_is_banned( IN username name )
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT STABLE;
+
+REVOKE ALL ON FUNCTION credcheck_record_auth_failure(name) FROM PUBLIC;
+REVOKE ALL ON FUNCTION credcheck_is_banned(name) FROM PUBLIC;

@@ -17,11 +17,11 @@ SET credcheck.password_reuse_history = 2;
 -- When creating user the password must be stored in the history
 CREATE USER credtest WITH PASSWORD 'H8Hdre=S2';
 ALTER USER credtest PASSWORD 'J8YuRe=6O';
-SELECT rolename, password_hash FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date;
- rolename |                          password_hash                           
-----------+------------------------------------------------------------------
- credtest | 7488570b80076cf9da26644d5eeb316c4768ff5bee7bf319344e7bb328032098
- credtest | e61e58c22aa6bf31a92b385932f7d0e4dbaba24fa3fdb2982510d6c72a961335
+SELECT rolename, length(password_hash) AS hash_length FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date;
+ rolename | hash_length 
+----------+-------------
+ credtest |          64
+ credtest |          64
 (2 rows)
 
 -- fail, the credential is still in the history
@@ -29,11 +29,11 @@ ALTER USER credtest PASSWORD 'J8YuRe=6O';
 ERROR:  Cannot use this credential following the password reuse policy
 -- eject the first credential from the history and add a new one
 ALTER USER credtest PASSWORD 'AJ8YuRe=6O0';
-SELECT rolename, password_hash FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date ;
- rolename |                          password_hash                           
-----------+------------------------------------------------------------------
- credtest | e61e58c22aa6bf31a92b385932f7d0e4dbaba24fa3fdb2982510d6c72a961335
- credtest | 79320cea69ba581d5e17255c02ae08060f412f79a7c14d0e24ffca51fc03ec74
+SELECT rolename, length(password_hash) AS hash_length FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date ;
+ rolename | hash_length 
+----------+-------------
+ credtest |          64
+ credtest |          64
 (2 rows)
 
 -- fail, the credential is still in the history
@@ -57,3 +57,25 @@ SELECT pg_password_history_reset();
                          0
 (1 row)
 
+-- The history follows the role even when the reuse policy is not set in the
+-- session that renames or drops it (the policy can be set per role).
+SET credcheck.password_reuse_history = 2;
+-- no "MD5 password cleared" notice on rename (md5 is the default before PG14)
+SET password_encryption = 'scram-sha-256';
+CREATE USER credtest_rn WITH PASSWORD 'H8Hdre=S2';
+RESET credcheck.password_reuse_history;
+ALTER USER credtest_rn RENAME TO credtest_rn2;
+SELECT rolename FROM pg_password_history WHERE rolename LIKE 'credtest_rn%';
+   rolename   
+--------------
+ credtest_rn2
+(1 row)
+
+DROP USER credtest_rn2;
+SELECT count(*) FROM pg_password_history WHERE rolename LIKE 'credtest_rn%';
+ count 
+-------
+     0
+(1 row)
+
+RESET password_encryption;

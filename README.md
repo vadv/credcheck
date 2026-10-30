@@ -10,8 +10,9 @@
 	- [Force password change](#force-password-change)
 	- [Prohibit password changes](#disallow-password-change)
 	- [Warning before password expire](#warning-before-password-expire)
+	- [Password masking in logs](#password-masking-in-logs)
 	- [Last login information](#last-login-information)
-    - [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgpouncer)
+    - [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgbouncer)
 	- [Examples](#examples)
 	- [Limitations](#limitations)
 	- [Authors](#authors)
@@ -103,6 +104,15 @@ Please find the below list of general checks, which we can enforce on credential
 | password_valid_warning | password | throw a warning N days before the password expires | 0 (disabled) |  |  |
 | password_change_first_login | password | force the user to change his password at first login | false (disabled) |  |  |
 
+Lengths and counts are expressed in characters of the database encoding, so
+a multibyte character such as `ф` or `é` in a UTF8 database counts as one
+character for the length and repeat rules. For the character class rules, a
+multibyte letter is an uppercase or lowercase character when the case mapping
+of the database collation changes it (as `upper()` and `lower()` do), and any
+other multibyte character counts as one special character; digits are the
+ASCII digits only. The `*_ignore_case` settings lowercase following the
+database collation too.
+
 There is also the `credcheck.whitelist` GUC that can be used to set a comma separated list of username to exclude from the password policy check. For example:
 ```
 credcheck.whitelist = 'admin,supuser'
@@ -151,32 +161,41 @@ contrib_regression=# select * from pg_lastlog;
 ```
 
 It is also possible to store the last query executed by the user by enabling
-`credcheck.lastlog_track_query`. The query is truncated by default at 1024 bytes
-but this size can be increased using `credcheck.lastlog_query_size`.
+`credcheck.lastlog_track_query`. This is the last statement sent by the client,
+utility statements included: when a query string holds several statements
+only the one being executed is kept, and statements executed by a function
+are not recorded. Passwords are masked as in the server log (see
+[Password masking in logs](#password-masking-in-logs)). The query is truncated
+by default at 1024 bytes but this size can be increased using
+`credcheck.lastlog_query_size`.
 
-### [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgpouncer)
+### [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgbouncer)
 
 #### Why the counter is bypassed
 
-credcheck counts authentication failures only fires for connections that reach
+credcheck counts authentication failures only for connections that reach
 PostgreSQL. With `auth_query` (or a userlist), PgBouncer fetches the password
 hash and **verifies the password itself**; a wrong password fails inside
 PgBouncer and no client connection is ever attempted against PostgreSQL. The
 hook never fires, so nothing is counted and no ban is set. This cannot be
 intercepted from inside PostgreSQL — the failure happens in another process.
 
-The patch adds an integration surface so the PgBouncer edge can feed failures
-into credcheck's own ban state (one `credcheck.max_auth_failure` threshold
-governs both direct and pooled connections) and enforce bans through
-`auth_query`.
+credcheck provides two functions so the PgBouncer edge can feed failures into
+credcheck's own ban state (one `credcheck.max_auth_failure` threshold governs
+both direct and pooled connections) and enforce bans through `auth_query`.
 
 #### SQL functions
 
 - `credcheck_record_auth_failure(username name) returns int`
   Report one failure; credcheck applies `credcheck.max_auth_failure` and bans at
-  the threshold. Returns the new count. Superuser-only, REVOKEd from PUBLIC.
+  the threshold. Returns the new count, or 0 when nothing was recorded (feature
+  disabled, role whitelisted or unknown, cache full). REVOKEd from PUBLIC: GRANT
+  EXECUTE to the reporting role only, it does not need to be a superuser.
 - `credcheck_is_banned(username name) returns bool`
-  True once the role is banned. Read-only; grant to the auth_query role.
+  True once the role is banned. Follows the same rules as a direct connection:
+  roles in `credcheck.whitelist_auth_failure` are never banned, and with
+  `credcheck.reset_superuser` the bootstrap superuser is not reported as banned.
+  Read-only, REVOKEd from PUBLIC.
 
 Existing `pg_banned_role` (view) and `pg_banned_role_reset(name)` are reused for
 inspection and unban.
@@ -198,8 +217,12 @@ LANGUAGE sql SECURITY DEFINER AS $$
 $$;
 REVOKE ALL ON FUNCTION public.pgbouncer_auth(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.pgbouncer_auth(text) TO <pgbouncer_auth_user>;
-GRANT EXECUTE ON FUNCTION credcheck_is_banned(name)   TO <pgbouncer_auth_user>;
 ```
+
+Because `pgbouncer_auth()` is SECURITY DEFINER, `credcheck_is_banned()` is
+executed with the privileges of the function owner: if the owner is not a
+superuser, `GRANT EXECUTE ON FUNCTION credcheck_is_banned(name)` to the owner,
+not to `<pgbouncer_auth_user>`.
 
 pgbouncer.ini:
 ```
@@ -229,19 +252,30 @@ Action — report each failure to credcheck (injection-safe via psql `:'u'`):
 actionban = psql "host=PGHOST port=5432 user=f2b_reporter dbname=postgres" \
               -X -q -v ON_ERROR_STOP=1 \
               -c "SELECT credcheck_record_auth_failure(:'u')" -v u="<F-USER>"
-actionunban = psql "host=PGHOST port=5432 user=f2b_reporter dbname=postgres" \
-              -X -q -c "SELECT pg_banned_role_reset(:'u')" -v u="<F-USER>"
+actionunban =
 ```
 
-Grant the reporter role:
+Leave `actionunban` empty: credcheck owns both the threshold and the ban. An
+unban action calling `pg_banned_role_reset()` would clear the role's failure
+counter each time fail2ban's `bantime` expires, so the counter could never reach
+`credcheck.max_auth_failure` unless all failures happen within one `bantime`.
+Unban roles with `pg_banned_role_reset()` as described above.
+
+Grant the reporter role (in the database where credcheck is installed):
 ```sql
-GRANT EXECUTE ON FUNCTION credcheck_record_auth_failure(name) TO f2b_reporter; -- superuser-only fn
+CREATE ROLE f2b_reporter LOGIN PASSWORD '...';
+GRANT EXECUTE ON FUNCTION credcheck_record_auth_failure(name) TO f2b_reporter;
 ```
-(record_auth_failure enforces superuser() internally; run the reporter as a
-superuser, or wrap it in a SECURITY DEFINER function you own and grant that.)
 
-Set fail2ban `maxretry = 1` so every failure is forwarded and credcheck owns the
-threshold via `credcheck.max_auth_failure`.
+In the jail, set `maxretry = 1` so every failure is forwarded and credcheck owns
+the threshold via `credcheck.max_auth_failure`, and keep `bantime` short (a few
+seconds): while an address is banned, fail2ban does not run the ban action again
+for new failures from it, so those failures would not be reported.
+
+Limitation: a successful login through PgBouncer does not reach PostgreSQL
+either, so it does not reset the failure counter as a direct successful login
+does; failures reported for a role accumulate until it is banned or reset with
+`pg_banned_role_reset()`.
 
 ### [Examples](#examples)
 
@@ -433,7 +467,28 @@ But one thing was missing, there was no password reuse policy enforcement. That 
 
 The credcheck extension adds the "Password Reuse Policy" in release 1.0. To used this feature, the credcheck extension MUST be added to `shared_preload_libraries` configuration option.
 
-All users passwords are historicized in shared memory together with the timestamps of when these passwords were set. The passwords history is saved into a file named `$PGDATA/pg_password_history` to be reloaded in shared memory at startup. This file must be part of your backups if you don't want to loose the password history, hopefully pg_basebackup will take care of it. Starting from PostgreSQL 15, the password history is also replication-aware: a custom WAL resource manager ships every mutation (add, remove, rename, reset, timestamp update) to standbys through the usual WAL streaming, so the history stays consistent across a primary/replica setup and survives a failover. Passwords are stored and compared as sha256 hashes, never in plain text.
+All users passwords are historicized in shared memory together with the timestamps of when these passwords were set. The passwords history is saved into a file named `$PGDATA/pg_password_history` to be reloaded in shared memory at startup. This file must be part of your backups if you don't want to loose the password history, hopefully pg_basebackup will take care of it. Starting from PostgreSQL 15, the password history is also replication-aware: a custom WAL resource manager ships every mutation (add, remove, rename, reset, timestamp update) to standbys through the usual WAL streaming, so the history stays consistent across a primary/replica setup and survives a failover. Passwords are stored and compared as sha256 hashes, never in plain text. From PostgreSQL 14, the hash is an HMAC-SHA256 salted with the OID of the role, so the same password gives a different hash for each role and the history still applies after `ALTER ROLE ... RENAME`. Up to credcheck 6.0 the salt was the role name: such entries are still checked until they leave the history, but they no longer match once the role has been renamed. Before PostgreSQL 14 the hash is not salted.
+
+The password history follows the transactions. The changes made by `CREATE ROLE`,
+`ALTER ROLE ... PASSWORD`, `ALTER ROLE ... RENAME` and `DROP ROLE` are only
+applied to the history, and written to the WAL, when the transaction commits:
+
+* a rolled back transaction, a `ROLLBACK TO SAVEPOINT` or a PL/pgSQL exception
+  block leaves no trace in the history, old entries are not removed either;
+* until the commit, the changes are only visible to the transaction that made
+  them: its own password checks take them into account (setting the same new
+  password twice is rejected, `DROP ROLE` then `CREATE ROLE` of the same name
+  starts a new history) but the `pg_password_history` view shows the committed
+  history only;
+* a transaction that changed the history can not be prepared with
+  `PREPARE TRANSACTION`;
+* a password change waits for the end of a transaction that has already
+  changed the password of the same role, instead of failing with a
+  "tuple concurrently updated" error, so that it is checked against the
+  committed history.
+
+The functions `pg_password_history_reset()` and `pg_password_history_timestamp()`
+are not transactional, they change the history immediately.
 
 The password history size is set to 65535 records by default and can be adjusted using the `credcheck.history_max_size` configuration directive. Change of this GUC require a PostgreSQL restart. One record in the history takes 144 bytes, so the default is to allocate around 10 MB of additional shared memory for the password history.
 
@@ -681,6 +736,47 @@ CREATE EVENT TRIGGER valid_until_warning
 ALTER EVENT TRIGGER valid_until_warning ENABLE ALWAYS;
 ```
 This DDL is also provided in the separated file `event_trigger.sql`.
+
+### [Password masking in logs](#password-masking-in-logs)
+
+When `credcheck.no_password_logging` is enabled (the default), credcheck masks
+passwords in the messages sent to the server log (statements logged by
+`log_statement` or `log_min_duration_statement`, the `STATEMENT:` line of an
+error, error details and context) and in the `query` column of `pg_lastlog`
+(the latter always, whatever the value of `credcheck.no_password_logging`).
+Each character of the secret is replaced by a dot, for example:
+
+```
+LOG:  statement: CREATE ROLE alice LOGIN PASSWORD '............';
+```
+
+The text is scanned as SQL, so comments, quoted identifiers and ordinary data
+are not affected, and the following are masked:
+
+- the value of a `PASSWORD` clause written as a string literal (`'...'`,
+  `E'...'`) or a dollar-quoted string (`$tag$...$tag$`), which also covers
+  FDW options such as `OPTIONS (password '...')`;
+- the same clauses inside the body of a `DO` block, a routine body or any other
+  string literal or dollar-quoted string that contains the word `password`;
+- every literal argument of `pg_check_password()`, and named arguments called
+  `password` (`password => '...'`).
+
+Masking can only work on the text of the statement. It can not detect a
+password that is not written as the value of one of these constructs, for
+example:
+
+- a password given to a misspelled option (`PASSWORG '...'`), which is
+  rejected and logged as is;
+- a password passed to a user-defined function that wraps `pg_check_password()`
+  or that executes `ALTER ROLE`;
+- a password stored in a variable and used later, for example in a `DO` block
+  that builds the `CREATE ROLE` command with `format()`;
+- a password in a connection string, such as `dblink_connect('... password=...')`.
+
+The only way to never have a clear text password in a statement is to send it
+already encrypted, as psql's `\password` command does. Note that credcheck
+rejects an encrypted password unless `credcheck.encrypted_password_allowed` is
+enabled, and can not apply the password checks to it.
 
 ### [Limitations](#limitations)
 
