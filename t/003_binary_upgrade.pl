@@ -132,4 +132,35 @@ if ($ret == 0)
 		'binary upgrade records restored verifiers in password history');
 }
 
+# rolvaliduntil is catalog data: the restore must reproduce it as-is,
+# whatever VALID UNTIL policy the new cluster enforces for interactive
+# password changes.  pg_dumpall --binary-upgrade emits CREATE ROLE
+# followed by ALTER ROLE ... [VALID UNTIL ...], so replay exactly that
+# pair under each policy that can rewrite or reject the dumped value.
+my @valid_until_cases = (
+	# [ policy GUC, VALID UNTIL clause of the dump, expected rolvaliduntil ]
+	[ 'password_valid_until = 30', q{VALID UNTIL '2020-01-01 00:00:00+00'}, q{'2020-01-01 00:00:00+00'} ],
+	[ 'password_valid_until = 30', '', 'NULL' ],
+	[ 'password_valid_min = 30',   '', 'NULL' ],
+	[ 'password_valid_max = 30',   q{VALID UNTIL 'infinity'}, q{'infinity'} ],
+	[ 'password_valid_max = 30',   '', 'NULL' ],
+);
+my $vu = 0;
+foreach my $case (@valid_until_cases)
+{
+	my ($guc, $clause, $expected) = @$case;
+	my $role = 'binary_validity_' . ++$vu;
+	# SCRAM verifiers do not embed the role name, so $scram can be reused.
+	($ret, $stdout, $stderr) = $node->psql('postgres',
+		"SET credcheck.$guc;
+		 CREATE ROLE $role;
+		 ALTER ROLE $role WITH LOGIN PASSWORD '$scram' $clause");
+	is($ret, 0, "binary upgrade restores $role under $guc");
+	diag($stderr) if $ret != 0;
+	is($node->safe_psql('postgres',
+			"SELECT rolvaliduntil IS NOT DISTINCT FROM ${expected}::timestamptz
+			 FROM pg_authid WHERE rolname = '$role'"),
+		't', "$role keeps rolvaliduntil = $expected");
+}
+
 done_testing();
