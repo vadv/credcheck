@@ -2222,7 +2222,8 @@ check_password(const char *username, const char *password,
 			break;
 		}
 		default:
-			if (!encrypted_password_allowed)
+			/* pg_upgrade restores verifiers already accepted by the old cluster */
+			if (!encrypted_password_allowed && !IsBinaryUpgrade)
 				ereport(ERROR,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg(gettext_noop("password type is not a plain text"))));
