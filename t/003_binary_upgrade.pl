@@ -5,33 +5,40 @@
 # gets in the way:
 #
 #   1. pg_upgrade dumps the old cluster's globals with
-#      "pg_dumpall --globals-only --binary-upgrade".  For every role that
-#      has a password, the dump carries the *encrypted* verifier verbatim
-#      (src/bin/pg_dump/pg_dumpall.c, dumpRoles()):
+#      "pg_dumpall --globals-only --binary-upgrade".  For every role the
+#      dump carries its OID, its *encrypted* password verifier and its
+#      rolvaliduntil verbatim (src/bin/pg_dump/pg_dumpall.c, dumpRoles()):
 #
 #        SELECT pg_catalog.binary_upgrade_set_next_pg_authid_oid('16384');
-#        ALTER ROLE ... PASSWORD 'SCRAM-SHA-256$4096:...';
+#        CREATE ROLE r;
+#        ALTER ROLE r WITH ... PASSWORD 'SCRAM-SHA-256$4096:...'
+#                              [VALID UNTIL '...'];
 #
 #   2. pg_upgrade replays that script against the new cluster, which it
 #      starts with "pg_ctl start -o '-p <port> -b ...'"
-#      (src/bin/pg_upgrade/server.c), i.e. the server runs with
-#      binary_upgrade = on.
+#      (src/bin/pg_upgrade/server.c), i.e. the server runs in binary
+#      upgrade mode (IsBinaryUpgrade).
 #
 #   3. credcheck is in shared_preload_libraries on the new cluster as well,
-#      so its hooks see the ALTER ROLE ... PASSWORD '<SCRAM-SHA-256$...>'
-#      statements of the restore phase.  Without special handling credcheck
-#      mistakes the encrypted verifier for a plaintext password and aborts
-#      the whole pg_upgrade with:
+#      so its hooks see these statements as if a user ran them:
+#      - the encrypted verifier is rejected unless
+#        credcheck.encrypted_password_allowed is on, which aborts the whole
+#        pg_upgrade with "ERROR:  password type is not a plain text";
+#      - credcheck.password_valid_until/_min/_max rewrite the dumped
+#        rolvaliduntil to now() + N days or reject it.
 #
-#        ERROR:  password type is not a plain text
+# In binary upgrade mode credcheck therefore behaves as if
+# encrypted_password_allowed were on and the VALID UNTIL policy GUCs were 0.
+# Everything else follows the regular path, so the restored verifiers are
+# recorded in the password history.
 #
-# This test reproduces that exact step without dragging in the full
-# old-cluster/new-cluster machinery of a real pg_upgrade: the restore step
-# only needs a server started with -b, which is exactly how pg_upgrade
-# starts the new cluster.  We build a small "old cluster" state (roles with
-# encrypted verifiers and reuse history), restart the
-# server in binary-upgrade mode the way pg_upgrade does, and replay the
-# ALTER ROLE statements that pg_dumpall --binary-upgrade would emit.
+# This test reproduces the restore step without the full
+# old-cluster/new-cluster machinery of a real pg_upgrade: it only needs a
+# server started with -b, exactly as pg_upgrade starts the new cluster.
+# We build a small "old cluster" state (roles with encrypted verifiers and
+# reuse history), restart the server in binary upgrade mode the way
+# pg_upgrade does, and replay the statements pg_dumpall --binary-upgrade
+# would emit.
 
 use strict;
 use warnings FATAL => 'all';
@@ -69,9 +76,9 @@ my $history_before = $node->safe_psql('postgres',
 	  WHERE rolename LIKE 'binary_%' GROUP BY rolename ORDER BY rolename});
 
 # The fixture mimics a source cluster of a pg_upgrade: roles were created
-# through the normal policy path, so they have encrypted SCRAM verifiers,
+# through the normal policy path, so they have encrypted SCRAM verifiers
 # and password reuse history entries.
-# Sanity check for the fix: outside binary upgrade the very same statement
+# Outside binary upgrade the very same statement
 # (an encrypted verifier pasted into ALTER ROLE, as the pg_dumpall script
 # contains it) must still be rejected -- the binary-upgrade bypass may not
 # open a hole in normal operation.
@@ -111,9 +118,9 @@ if ($ret == 0)
 			q{SELECT rolpassword FROM pg_authid WHERE rolname = 'binary_scram'}),
 		$scram, 'SCRAM verifier is restored byte-for-byte');
 
-	# Restoring a role that has password reuse history: the replayed ALTER
-	# ROLE is a *restore*, not a user password change, so it must not run
-	# into the reuse policy either.
+	# Restoring a role that has password reuse history.  The reuse check
+	# runs as usual, but the history holds HMACs of the plaintext passwords
+	# set before, so the verifier never matches them.
 	($ret, $stdout, $stderr) = $node->psql('postgres',
 		"ALTER ROLE binary_history PASSWORD '$history_password'");
 	is($ret, 0, 'binary upgrade restores a role with reuse history enabled');
@@ -122,7 +129,8 @@ if ($ret == 0)
 	# The history store lives outside the catalog and is not carried over by
 	# pg_upgrade.  The restored verifier goes through the regular credcheck
 	# path, exactly as with credcheck.encrypted_password_allowed = on, so it
-	# lands in the history: one new entry per restored role.
+	# lands in the history: one new entry per restored role.  (Here the
+	# fixture entries are still present, a real new cluster starts empty.)
 	is($history_before, "binary_history|1\nbinary_scram|1",
 		'fixture has one history entry per role');
 	is($node->safe_psql('postgres',
@@ -133,10 +141,11 @@ if ($ret == 0)
 }
 
 # rolvaliduntil is catalog data: the restore must reproduce it as-is,
-# whatever VALID UNTIL policy the new cluster enforces for interactive
-# password changes.  pg_dumpall --binary-upgrade emits CREATE ROLE
-# followed by ALTER ROLE ... [VALID UNTIL ...], so replay exactly that
-# pair under each policy that can rewrite or reject the dumped value.
+# whatever VALID UNTIL policy the new cluster enforces for user password
+# changes.  Replay the CREATE ROLE + ALTER ROLE ... [VALID UNTIL ...] pair
+# of pg_dumpall --binary-upgrade under each policy that would otherwise
+# rewrite the dumped value (an expiry injected into a role that had none)
+# or reject it (an expired or too distant date, a missing VALID UNTIL).
 my @valid_until_cases = (
 	# [ policy GUC, VALID UNTIL clause of the dump, expected rolvaliduntil ]
 	[ 'password_valid_until = 30', q{VALID UNTIL '2020-01-01 00:00:00+00'}, q{'2020-01-01 00:00:00+00'} ],
@@ -150,7 +159,7 @@ foreach my $case (@valid_until_cases)
 {
 	my ($guc, $clause, $expected) = @$case;
 	my $role = 'binary_validity_' . ++$vu;
-	my $authid = 16390 + $vu;
+	my $authid = 100000 + $vu;    # far from the fixture's role OIDs
 	# SCRAM verifiers do not embed the role name, so $scram can be reused.
 	# The OID preset is what pg_dumpall --binary-upgrade emits before every
 	# CREATE ROLE; without it core rejects role creation in binary upgrade
