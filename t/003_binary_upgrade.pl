@@ -150,9 +150,14 @@ foreach my $case (@valid_until_cases)
 {
 	my ($guc, $clause, $expected) = @$case;
 	my $role = 'binary_validity_' . ++$vu;
+	my $authid = 16390 + $vu;
 	# SCRAM verifiers do not embed the role name, so $scram can be reused.
+	# The OID preset is what pg_dumpall --binary-upgrade emits before every
+	# CREATE ROLE; without it core rejects role creation in binary upgrade
+	# mode (commands/user.c: "pg_authid OID value not set ...").
 	($ret, $stdout, $stderr) = $node->psql('postgres',
-		"SET credcheck.$guc;
+		"SELECT pg_catalog.binary_upgrade_set_next_pg_authid_oid('$authid');
+		 SET credcheck.$guc;
 		 CREATE ROLE $role;
 		 ALTER ROLE $role WITH LOGIN PASSWORD '$scram' $clause");
 	is($ret, 0, "binary upgrade restores $role under $guc");
